@@ -96,7 +96,7 @@ def main():
     eta = recommended["distance"] * 2
     print("\n---------------------------------------")
     print(" Recommended Hospital")
-    print("---------------------------------------")
+    print("----------------------------------------")
     print("Hospital:", recommended["name"])
     print("Beds Available:", recommended["beds"])
     print("Specialization:", recommended["specialization"])
