@@ -1,110 +1,156 @@
-import heapq
+"""
+MedRoute — Emergency Ambulance Dispatch & Hospital Recommendation System
+Main Flask Application Entry Point.
+Serves the unified emergency response dashboard, static assets, and REST API.
+"""
 
-# Road network graph (adjacency list)
-graph = {
-    "A": {"B": 4, "C": 2},
-    "B": {"A": 4, "D": 5},
-    "C": {"A": 2, "D": 8},
-    "D": {"B": 5, "C": 8}
-}
+import os
+import sys
+from datetime import datetime, timezone
+from flask import Flask, jsonify, request, send_from_directory
 
-# Small sample data. The same rows can be shown in MySQL Workbench.
-hospitals = [
-    {"name": "City Care Hospital", "beds": 5, "specialization": "Cardiology", "node": "D"},
-    {"name": "Sunrise Hospital", "beds": 0, "specialization": "Cardiology", "node": "B"},
-    {"name": "General Care Hospital", "beds": 8, "specialization": "General", "node": "C"},
-    {"name": "Bone and Joint Hospital", "beds": 3, "specialization": "Orthopaedics", "node": "B"}
-]
+from config import Config
+from database import init_db, get_session
+from api.routes_stats import stats_bp
+from api.routes_hospitals import hospitals_bp
+from api.routes_ambulances import ambulances_bp
+from api.routes_network import network_bp
+from api.routes_dispatch import dispatch_bp
 
-
-def dijkstra(graph, start, end):
-    """Find the shortest distance and route using a priority queue (min heap)."""
-    queue = [(0, start, [start])]
-    visited = []
-
-    while queue:
-        distance, current, path = heapq.heappop(queue)
-        if current in visited:
-            continue
-
-        visited.append(current)
-        if current == end:
-            return distance, path
-
-        for neighbour, weight in graph[current].items():
-            if neighbour not in visited:
-                heapq.heappush(queue, (distance + weight, neighbour, path + [neighbour]))
-
-    return None, []
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 
 
-def get_specialization(emergency_type):
-    if emergency_type.lower() == "cardiac":
-        return "Cardiology"
-    elif emergency_type.lower() == "orthopaedic":
-        return "Orthopaedics"
-    return "General"
+def create_app(config_class=Config):
+    """Application factory for Flask application."""
+    app = Flask(
+        __name__,
+        static_folder=BASE_DIR,
+        static_url_path=""
+    )
+    app.config.from_object(config_class)
+
+    # Initialize SQL database tables
+    init_db(app.config["SQLALCHEMY_DATABASE_URI"])
+
+    # Register API Blueprints
+    app.register_blueprint(stats_bp, url_prefix="/api")
+    app.register_blueprint(hospitals_bp, url_prefix="/api")
+    app.register_blueprint(ambulances_bp, url_prefix="/api")
+    app.register_blueprint(network_bp, url_prefix="/api")
+    app.register_blueprint(dispatch_bp, url_prefix="/api")
+
+    # Global CORS headers
+    @app.after_request
+    def add_cors_headers(response):
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        return response
+
+    # Frontend Single Page Application routes
+    @app.route("/", methods=["GET"])
+    def index():
+        return send_from_directory(BASE_DIR, "index.html")
+
+    @app.route("/<path:filename>", methods=["GET"])
+    def static_assets(filename):
+        file_path = os.path.join(BASE_DIR, filename)
+        if os.path.isfile(file_path):
+            return send_from_directory(BASE_DIR, filename)
+        return send_from_directory(BASE_DIR, "index.html")
+
+    # Health check
+    @app.route("/api/health", methods=["GET"])
+    def health_check():
+        return jsonify({
+            "status": "online",
+            "service": "MedRoute Emergency Dispatch API",
+            "database": "connected",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
+    return app
 
 
-def find_hospital(location, emergency_type):
-    
-    required_specialization = get_specialization(emergency_type)
-    available_hospitals = []
-
-    # Filter: hospital must have beds and the correct specialization.
-    for hospital in hospitals:
-        if hospital["beds"] > 0 and hospital["specialization"] == required_specialization:
-            distance, route = dijkstra(graph, location, hospital["node"])
-            hospital_copy = hospital.copy()
-            hospital_copy["distance"] = distance
-            hospital_copy["route"] = route
-            available_hospitals.append(hospital_copy)
-
-    if len(available_hospitals) == 0:
-        return None
-
-    # Simple score: 70% distance and 30% available beds.
-    for hospital in available_hospitals:
-        distance_score = 10 - hospital["distance"]
-        bed_score = hospital["beds"]
-        hospital["score"] = (0.7 * distance_score) + (0.3 * bed_score)
-
-    available_hospitals.sort(key=lambda hospital: hospital["score"], reverse=True)
-    return available_hospitals[0]
+app = create_app()
 
 
-def main():
-    print("---------------------------------------")
-    print(" Emergency Ambulance Dispatch System")
-    print("---------------------------------------")
-    print("Available locations: A, B, C, D")
+def main_cli():
+    """Interactive command-line interface for manual execution or testing."""
+    from models import RoadEdge, Hospital
+    from algorithms.dijkstra import RoadNetworkGraph
+    from algorithms.recommender import HospitalRecommendationEngine
 
-    location = input("Patient Location: ").upper()
-    if location not in graph:
-        print("Invalid location. Please enter A, B, C, or D.")
-        return
+    session = get_session()
+    try:
+        edges = session.query(RoadEdge).filter(RoadEdge.status != "Closed").all()
+        road_graph = RoadNetworkGraph.from_database_edges(edges)
+        hospitals = session.query(Hospital).filter(Hospital.is_active == True).all()
 
-    emergency_type = input("Emergency Type (Cardiac/Orthopaedic/General): ")
-    severity = input("Severity (High/Medium/Low): ")
-    recommended = find_hospital(location, emergency_type)
+        print("=" * 55)
+        print(" Emergency Ambulance Dispatch & Recommendation (CLI)")
+        print("=" * 55)
+        print(f"Available Network Nodes: {', '.join(sorted(road_graph.nodes))}")
 
-    if recommended is None:
-        print("\nNo suitable hospital is available.")
-        return
+        location = input("Patient Location Node: ").strip().upper()
+        if location not in road_graph.nodes:
+            print(f"Error: Invalid location '{location}'. Available: {', '.join(sorted(road_graph.nodes))}")
+            return
 
-    # Assumption: one graph-distance unit takes approximately two minutes.
-    eta = recommended["distance"] * 2
-    print("\n---------------------------------------")
-    print(" Recommended Hospital")
-    print("----------------------------------------")
-    print("Hospital:", recommended["name"])
-    print("Beds Available:", recommended["beds"])
-    print("Specialization:", recommended["specialization"])
-    print("Severity:", severity)
-    print("Route:", " -> ".join(recommended["route"]))
-    print("Distance:", recommended["distance"], "km")
-    print("Estimated Travel Time:", eta, "minutes")
-    print("---------------------------------------")
+        emergency_type = input("Emergency Type (Cardiac/Trauma/Ortho/Neuro/General): ").strip()
+        severity = input("Severity (High/Medium/Low): ").strip() or "Medium"
+
+        engine = HospitalRecommendationEngine()
+        result = engine.evaluate_candidates(
+            hospitals=hospitals,
+            road_graph=road_graph,
+            patient_node=location,
+            emergency_type=emergency_type,
+            severity=severity
+        )
+
+        if not result.get("success"):
+            print("\nRecommendation Result: " + result.get("message", "No hospital found."))
+            for r in result.get("reasons", []):
+                print(f" - {r}")
+            return
+
+        best = result["recommended"]
+        print("\n" + "-" * 50)
+        print(" Recommended Hospital Destination")
+        print("-" * 50)
+        print(f"Hospital Name       : {best['name']}")
+        print(f"Location Node       : Node {best['node_id']}")
+        print(f"Available Beds      : {best['beds_available']} / {best['total_beds']}")
+        print(f"Specialization      : {best['specialization']}")
+        print(f"Calculated Route    : {' -> '.join(best['route'])}")
+        print(f"Distance            : {best['distance_km']} km")
+        print(f"Estimated Travel ETA: {best['travel_time_minutes']} minutes")
+        print(f"Suitability Score   : {best['suitability_score']} / 100")
+        print(f"Rationale           : {best['reasoning']}")
+        print("-" * 50)
+    finally:
+        session.close()
 
 
-main()
+if __name__ == "__main__":
+    if "--cli" in sys.argv:
+        main_cli()
+    else:
+        port = int(os.environ.get("PORT", 5000))
+        print("=" * 68)
+        print(" MedRoute — Emergency Ambulance Dispatch & Recommendation System")
+        print(f" Server active at: http://127.0.0.1:{port}")
+        print(" API endpoints registered:")
+        print(f"   • GET  http://127.0.0.1:{port}/api/health")
+        print(f"   • GET  http://127.0.0.1:{port}/api/stats")
+        print(f"   • GET  http://127.0.0.1:{port}/api/hospitals")
+        print(f"   • GET  http://127.0.0.1:{port}/api/ambulances")
+        print(f"   • GET  http://127.0.0.1:{port}/api/network")
+        print(f"   • POST http://127.0.0.1:{port}/api/dispatch")
+        print(f"   • POST http://127.0.0.1:{port}/api/dispatch/confirm")
+        print(f"   • GET  http://127.0.0.1:{port}/api/history")
+        print(" Web Dashboard:")
+        print(f"   • Open http://127.0.0.1:{port}/ in your web browser")
+        print("=" * 68)
+        app.run(host="0.0.0.0", port=port, debug=False)
